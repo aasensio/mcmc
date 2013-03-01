@@ -10,7 +10,7 @@
 ;        type: strarr(npar)  -> prior type ('U', 'G', 'D', 'J')
 ;        mu: dblarr(npar)    -> mean of the prior distribution if Gaussian
 ;        sigma: dblarr(npar)    -> standard deviation of the prior distribution if Gaussian
-;        
+;
 ; data: any structure that will be passed to the evaluation of the posterior distribution function
 ; adaptive_metropolis: initialize an adaptive Metropolis chain
 ; metropolis_within_gibbs: initialize an adaptive Metropolis-within-Gibbs chain
@@ -25,6 +25,7 @@ on_error, 2
 	self.chain = ptr_new(dblarr(1,npar))
 	self.mean = ptr_new(dblarr(npar))
 	self.covariance = ptr_new(dblarr(npar,npar))
+	self.cholesky = ptr_new(dblarr(npar,npar))
 	self.identity = ptr_new(identity(npar,/double))
 	self.trial = ptr_new(dblarr(npar))
 	self.step = ptr_new(0)
@@ -33,9 +34,10 @@ on_error, 2
 	self.logp = ptr_new(0.d0)
 	self.logptrial = ptr_new(0.d0)
 	self.alpha = ptr_new(0.d0)
+	self.nCov = ptr_new(1000)
 
 	self.algorithm = ptr_new('MCMC')
-	
+
 	if (keyword_set(adaptive_metropolis)) then begin
 		self.algorithm = ptr_new('ADAPTIVE')
 	endif
@@ -45,7 +47,7 @@ on_error, 2
 		self.lsaccepted = ptr_new(dblarr(npar))
 		self.steps_in_batch = ptr_new(0)
 	endif
-	
+
 	return, 1
 end
 
@@ -58,6 +60,7 @@ function mcmc::cleanup
 	ptr_free, self.pars
 	ptr_free, self.mean
 	ptr_free, self.covariance
+	ptr_free, self.cholesky
 	ptr_free, self.trial
 	ptr_free, self.step
 	ptr_free, self.stepaccepted
@@ -66,11 +69,12 @@ function mcmc::cleanup
 	ptr_free, self.alpha
 	ptr_free, self.identity
 	ptr_free, self.algorithm
+	ptr_free, self.nCov
 	if (ptr_valid(self.ls)) then ptr_free, self.ls
 	if (ptr_valid(self.lsaccepted)) then ptr_free, self.lsaccepted
 	if (ptr_valid(self.steps_in_batch)) then ptr_free, self.steps_in_batch
 	return, 1
-end 
+end
 
 ;***************************************
 ; Functions to get the parameters from the Markov chain
@@ -89,7 +93,7 @@ end
 ;***************************************
 ; Functions to get the mean of the parameters from the Markov chain
 ;***************************************
-function mcmc::getMean	
+function mcmc::getMean
 	return, average((*self.chain),1)
 end
 
@@ -124,7 +128,7 @@ end
 ;***************************************
 ; Functions to thin the chain
 ;***************************************
-pro mcmc::thinChain, factor	
+pro mcmc::thinChain, factor
    new_length = (*self.step) / factor
    b = congrid( (*self.chain), new_length, (*self.npar) )
    ptr_free, self.chain
@@ -168,22 +172,21 @@ end
 ; reset: reset the statistics before beginning
 ;***************************************
 pro mcmc::update_stat, reset=reset
-		
-	n = (*self.step)
-	
+
+	indexFrom = (*self.step) - (*self.nCov)
+	indexTo = (*self.step) - 1
+
 ; Update the mean
-	mold = (*self.mean)
-	(*self.mean) = mold + ( (*self.pars) - mold) / (n+1.d0)
-		
-; Update the covariance
-	for i = 0, (*self.npar)-1 do begin
-		for j = 0, (*self.npar)-1 do begin
-			(*self.covariance)[i,j] = (n-1.d0)/n * (*self.covariance)[i,j] + $
-				( (*self.pars)[i]-mold[i] ) * ( (*self.pars)[j] - mold[j] ) / $
-				(n+1.d0)^2 + ( (*self.pars)[i] - (*self.mean)[i] )*$
-				( (*self.pars)[j] - (*self.mean)[j] ) / (n*1.d0)
-		endfor		
-	endfor
+ 	(*self.mean) = total((*self.chain)[indexFrom:indexTo,*],1) / (*self.nCov)
+
+; Update the covariance matrix
+	temp = (*self.chain)[indexFrom:indexTo,*]
+	for i = 0, (*self.npar)-1 do temp[*,i] = temp[*,i] - (*self.mean)[i]
+
+	(*self.covariance) = temp ## transpose(temp) / (*self.nCov)
+
+	(*self.cholesky) = computeCholesky((*self.alpha)^2 * (*self.covariance))
+
 end
 
 ;***************************************
@@ -195,7 +198,8 @@ function mcmc::selectTrial
 
 ; Standard MCMC with Normal proposal that uses an adaptive covariance matrix
 	if ((*self.algorithm) eq 'MCMC') then begin
-		out = mrandomn(seed, (*self.pars), (*self.alpha) * (*self.covariance), 1)
+; 		out = mrandomn(seed, (*self.pars), (*self.alpha) * (*self.covariance), 1)
+		out = mrandomn_cholesky(seed, (*self.pars), (*self.cholesky), 1)
 	endif
 
 ; Adaptive Metropolis with mixture of Gaussians
@@ -203,11 +207,11 @@ function mcmc::selectTrial
 
 ; If iteration is smaller than 2*d
 		if ((*self.step) le 2*(*self.npar)) then begin
-		
+
 ; Generate a random number from the Gaussians N(mu=x,sigma^2=0.1^2*I/d)
 			out = mrandomn(seed, (*self.pars), 0.1^2 / (*self.npar) * (*self.identity), 1)
 		endif else begin
-		
+
 ; Generate a random number from the mixture of Gaussians (1-b)*N(mu=x,sigma^2=2.38^2*Sigma/d) + b*N(mu=x,sigma^2=0.1^2*I/d)
 			covar1 = 2.38^2 * (*self.covariance) / (*self.npar)
 			covar2 = 0.1^2 * (*self.identity) / (*self.npar)
@@ -222,7 +226,7 @@ function mcmc::selectTrial
 		sigma = exp(*self.ls)
 		out = (*self.pars) + sigma*randomn(seed,(*self.npar))
 	endif
-	
+
 	return, out
 end
 
@@ -232,17 +236,17 @@ end
 ; outBounds: set this to 1 if the proposed model is outside the boundaries
 ;***************************************
 function mcmc::evalPrior, trial, outBounds=outBounds
-	
+
 	logprior = 0.d0
 	outBounds = 0
-	
+
 	for i = 0, (*self.npar)-1 do begin
 
 ; Dirac delta prior
 		if ((*self.prior).type[i] eq 'DIRAC') then begin
 			trial[i] = (*self.prior).mu[i]
 		endif
-		
+
 ; Verify that everything is inside bounds
 		if (trial[i] gt (*self.prior).right[i] or trial[i] lt (*self.prior).left[i]) then begin
 			outBounds = 1
@@ -299,62 +303,10 @@ function mcmc::evalPrior, trial, outBounds=outBounds
 			sigma = (*self.prior).sigma[i]
 			logprior = logprior - alog(1.d0+((trial[i]-mu)/sigma)^2)
 		endif
-		
+
 	endfor
-		
+
 	return, logprior
-end
-
-;***************************************
-; Evaluate the log-likelihood at the present point (a simple Gaussian likelihood in this case)
-; trial: value of the trial parameters
-; outBounds: set this to 1 if the proposed model is outside the boundaries
-;***************************************
-function mcmc::evalTarget, trial, outBounds=outBounds
-
-; Evaluate the prior
-	logprior = self->evalPrior(trial, outBounds=outBounds)
-	
-; If the point is outside the bounds, return 0
-	if (logprior eq 0 and outBounds eq 1) then begin
-		logposterior = 0.d0
-		return, logposterior
-	endif
-
-;-------------------------------------------------------------------
-; Evaluate likelihood. We choose a normal likelihood for a linear fit
-;-------------------------------------------------------------------
-; 	a = trial[0]
-; 	b = trial[1]
-; 	model = a * (*self.data).x + b
-; 	chi2 = total( ((*self.data).y - model)^2 / ( (*self.data).sigma^2 ))
-
-
-;-------------------------------------------------------------------
-; Evaluate likelihood. We choose a normal likelihood for Metropolis-within-Gibbs problem
-;-------------------------------------------------------------------
-	K = (*self.data).K
-
-	A = trial[0]
-	V = trial[1]
-	mu = trial[2]
-	theta = trial[3:*]
-
-	loghyper = 0.d0
-	for i = 0, K-1 do begin		
-		loghyper = loghyper - alog(A) - alog(1.d0+((theta[i]-mu)/A)^2)
-	endfor
-
-	logL = 0.d0
-	for i = 0, K-1 do begin
-		n = (*self.data).r
-		Y = (*self.data).y[i,*]
-		logL = logL - 0.5d0 * n * alog(V) - total( (Y - theta[i])^2 ) / (2.d0*V)
-	endfor
-			
-	logposterior = logL + logprior + loghyper
-	
-	return, logposterior
 end
 
 ;***************************************
@@ -368,14 +320,14 @@ function mcmc::initChain
 	(*self.mean) = (*self.pars)
 
 	(*self.chain)[0,*] = (*self.pars)
-	
+
 ; Initial covariance matrix is chosen to be 10% of the available width of the hyperspace
 	for i = 0, (*self.npar)-1 do begin
 		(*self.covariance)[i,i] = 0.1d0 * ((*self.prior).right[i] - (*self.prior).left[i])
 	endfor
-	
+
 	(*self.logp) = self->evalTarget((*self.pars))
-	
+
 	(*self.alpha) = 1.d0
 
 end
@@ -389,44 +341,41 @@ function mcmc::stepChain
 ; Add one step to the chain counter
 	(*self.step) = (*self.step) + 1
 	logp = (*self.logp)
-	
+
 ; Propose a new set of parameters
 	trial = self->selectTrial()
 
 ; Evaluate the posterior
 	logptrial = self->evalTarget(trial, outBounds=outBounds)
-	
+
 ; If it is inside the boundaries
 	if (outBounds eq 0) then begin
-	
+
 ; Metropolis-Hastings step verification
 		r = exp(logptrial - logp)
 		alpha = min([1.d0,r])
 		ran = randomu(seed,1)
-		
-		
+
+
 		if (ran lt alpha) then begin
-			(*self.pars) = trial		
+			(*self.pars) = trial
 			(*self.logp) = logptrial
-			
+
 			(*self.stepaccepted) = (*self.stepaccepted) + 1
 		endif
 	endif
-	
+
 	acceptance = self->getAcceptanceRate()
-	
+
 ; Modify the scaling factor of the proposal distribution to adapt the acceptance rate
-	if ((*self.step) / 100 eq (*self.step) / 100.d0 and (*self.alpha) gt 0.05) then begin
-		if (acceptance gt 0.4d0 + 0.05d0) then begin
-			(*self.alpha) = (*self.alpha) * 1.04d0
+	if ((*self.step) / 1000 eq (*self.step) / 1000.d0) then begin
+		if (acceptance ge 0.44d0) then begin
+			(*self.alpha) = (*self.alpha) * 1.05d0
 		endif
-		if (acceptance lt 0.4d0 - 0.05d0) then begin
-			(*self.alpha) = (*self.alpha) * 0.96d0
-		endif		
-	endif
-	
-	if ((*self.step) gt 100) then begin
-  		self->update_stat
+		if (acceptance lt 0.23d0) then begin
+			(*self.alpha) = (*self.alpha) / 1.05d0
+		endif
+		self->update_stat
 	endif
 
 ; Update the chain
@@ -448,10 +397,10 @@ function mcmc::stepChain_metropolis_gibbs
 	(*self.step) = (*self.step) + 1
 	(*self.steps_in_batch) = (*self.steps_in_batch) + 1
 	reset_batch = 0
-	
+
 	logp = (*self.logp)
 
-; Save the original set of parameters	
+; Save the original set of parameters
 	updated_pars = (*self.pars)
 	old_pars = (*self.pars)
 
@@ -476,7 +425,7 @@ function mcmc::stepChain_metropolis_gibbs
 			ran = randomu(seed,1)
 
 ; If the MH step is successful, we keep the modification of the i-th parameter
-			if (ran lt alpha) then begin				
+			if (ran lt alpha) then begin
 				(*self.pars)[i] = updated_pars[i]
  				(*self.lsaccepted)[i] = (*self.lsaccepted)[i] + 1
  				logp = logptrial
@@ -497,14 +446,14 @@ function mcmc::stepChain_metropolis_gibbs
 			delta_n = min([0.01d0, 1.d0 / sqrt(n_batch)])
 
 ;  			if (i eq 3) then print, acceptance, delta_n, (*self.ls)[i]
-			
+
 			if (acceptance gt 0.44d0) then begin
 				(*self.ls)[i] = (*self.ls)[i] + delta_n
 			endif
 			if (acceptance lt 0.44d0) then begin
 				(*self.ls)[i] = (*self.ls)[i] - delta_n
 			endif
-			
+
 			reset_batch = 1
 		endif
 
@@ -512,20 +461,52 @@ function mcmc::stepChain_metropolis_gibbs
 
 	(*self.logp) = logp
 
-; Update the chain	
+; Update the chain
 	chain = (*self.chain)
 	chain = [chain, transpose((*self.pars))]
-	
+
 	ptr_free, self.chain
 	self.chain = ptr_new(chain)
 
 ; The next iteration starts a new batch of 50 steps
 	if (reset_batch eq 1) then begin
 		(*self.lsaccepted) = (*self.lsaccepted) * 0
-		(*self.steps_in_batch) = 0		
+		(*self.steps_in_batch) = 0
 	endif
 
 end
+
+;***************************************
+; Evaluate the log-likelihood at the present point (a simple Gaussian likelihood in this case)
+; trial: value of the trial parameters
+; outBounds: set this to 1 if the proposed model is outside the boundaries
+;***************************************
+function mcmc::evalTarget, trial, outBounds=outBounds
+
+; Evaluate the prior
+	logprior = self->evalPrior(trial, outBounds=outBounds)
+
+; If the point is outside the bounds, return 0
+	if (logprior eq 0 and outBounds eq 1) then begin
+		logposterior = 0.d0
+		return, logposterior
+	endif
+
+;-------------------------------------------------------------------
+; Evaluate likelihood. We choose a normal likelihood for a linear fit
+; This is equivalent to a standard chi^2 fitting
+; This case is the linear model y=a*x+b
+;-------------------------------------------------------------------
+ 	a = trial[0]
+ 	b = trial[1]
+ 	model = a * (*self.data).x + b
+ 	chi2 = total( ((*self.data).y - model)^2 / ( (*self.data).sigma^2 ))
+
+	logposterior = -0.5d0*chi2 + logprior
+
+	return, logposterior
+end
+
 
 pro mcmc__define
 
@@ -535,6 +516,7 @@ pro mcmc__define
 		pars : ptr_new(), $
 		mean : ptr_new(), $
 		covariance : ptr_new(), $
+		cholesky : ptr_new(), $
 		trial : ptr_new(), $
 		step : ptr_new(), $
 		prior : ptr_new(),$
@@ -547,12 +529,12 @@ pro mcmc__define
 		ls: ptr_new(),$
 		lsaccepted: ptr_new(),$
 		chain: ptr_new(),$
-		steps_in_batch: ptr_new()}
-	
-	return
-	
-end
+		steps_in_batch: ptr_new(), $
+		nCov: ptr_new()}
 
+	return
+
+end
 
 pro test_mcmc
 

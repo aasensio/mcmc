@@ -664,7 +664,7 @@ pro test_metropolis_gibbs
 	res = a->initChain()
 
 ; Do 20000 steps of the chain
-	nchain = 25000L
+	nchain = 50000L
 	pars = dblarr(K+3,nchain)
 	ls = dblarr(K+3,nchain)
 
